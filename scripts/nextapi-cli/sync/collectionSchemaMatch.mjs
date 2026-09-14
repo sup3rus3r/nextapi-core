@@ -4,7 +4,12 @@ import readline from "node:readline";
 import { BACKEND_DIR } from "../lib/paths.mjs";
 import { backendPackageNameForKey } from "../lib/moduleId.mjs";
 import { findHostCollection } from "../lib/hostCollections.mjs";
-import { parseModuleModelFields } from "../lib/pythonSchema.mjs";
+import {
+  parseModuleModelFields,
+  findCollectionClassSource,
+  listMethodNames,
+  extractMethodSource,
+} from "../lib/pythonSchema.mjs";
 
 // A module that declares backend.collection today always gets its OWN,
 // fully disconnected Mongo collection (namespaced per module, per
@@ -112,6 +117,99 @@ function ask(question) {
   });
 }
 
+const HOST_MODELS_PATH = path.join(BACKEND_DIR, "models_mongo.py");
+
+/**
+ * Returns the set of method names the module's OWN files actually call on
+ * its collection class (e.g. {"count", "list_page", "find_by_id", ...}) -
+ * scanned against the module's original class name, BEFORE
+ * linkToHostCollection renames any of those call sites. This is what
+ * field-shape compatibility alone can never catch: two collections can
+ * agree on every field and still be incompatible at the call-site level if
+ * the module's code expects methods the host's real class doesn't have
+ * (the exact production failure that motivated this - see
+ * AttributeError: 'UserCollection' object has no attribute 'count').
+ */
+function findCalledMethods(pkgDir, moduleCollectionClass) {
+  const calledMethods = new Set();
+  const callRe = new RegExp(`\\b${moduleCollectionClass}\\.(\\w+)\\s*\\(`, "g");
+  for (const file of fs.readdirSync(pkgDir)) {
+    if (!file.endsWith(".py")) continue;
+    const content = fs.readFileSync(path.join(pkgDir, file), "utf8");
+    for (const m of content.matchAll(callRe)) calledMethods.add(m[1]);
+  }
+  return calledMethods;
+}
+
+/**
+ * For every method the module calls that the HOST's real collection class
+ * doesn't already have, copies that method's implementation (verbatim, from
+ * the module's OWN models_mongo.py) into the host's real file as a new
+ * method on the host's real class - purely additive, never touching or
+ * replacing any method the host already has (see module-level comment: a
+ * same-named host method is always assumed authoritative, this only ever
+ * ADDS names that didn't exist before). Returns the list of method names
+ * actually adopted, for the caller to record on the lockfile entry and
+ * report to the user - writing into the host's own backend file is a
+ * materially bigger deal than the field-linking decision and must never be
+ * silent.
+ *
+ * KNOWN LIMITATION, disclosed rather than silently assumed away: this is
+ * purely name-based, exactly like the field-compatibility check above. If
+ * the module's own call site targets a method name the host's real class
+ * ALREADY has (e.g. both define "create"), this function does nothing for
+ * that name - the module's call becomes a call to the HOST's existing
+ * method (via linkToHostCollection's own class-name rewrite), and there is
+ * no way for static analysis to verify the two behave the same way. This
+ * mirrors the field-check's own honesty principle (a name match is not a
+ * behavior guarantee) rather than overclaiming a safety property this
+ * mechanism can't actually provide.
+ */
+function adoptMissingMethods(moduleModelsPath, moduleCollectionClass, hostEntry) {
+  const moduleContent = fs.readFileSync(moduleModelsPath, "utf8").replace(/\r\n/g, "\n");
+  const moduleClassSource = findCollectionClassSource(moduleContent, moduleCollectionClass);
+  if (!moduleClassSource) return [];
+
+  const pkgDir = path.dirname(moduleModelsPath);
+  const calledMethods = findCalledMethods(pkgDir, moduleCollectionClass);
+
+  const hostContent = fs.readFileSync(HOST_MODELS_PATH, "utf8").replace(/\r\n/g, "\n");
+  const hostClassSource = findCollectionClassSource(hostContent, hostEntry.collectionClass);
+  if (!hostClassSource) return [];
+  const hostMethods = listMethodNames(hostClassSource.body);
+
+  const toAdopt = [...calledMethods].filter((name) => !hostMethods.has(name));
+  if (toAdopt.length === 0) return [];
+
+  const adopted = [];
+  const adoptedSources = [];
+  for (const name of toAdopt) {
+    const source = extractMethodSource(moduleClassSource.body, name);
+    if (!source) continue; // module calls a name it doesn't itself define - nothing to adopt, nothing to report
+    adopted.push(name);
+    adoptedSources.push(source);
+  }
+  if (adopted.length === 0) return [];
+
+  // Splice the new methods in right at the end of the host class's own
+  // body, using the REAL byte offset findCollectionClassSource already
+  // computed against this exact normalized hostContent string - never
+  // reconstruct the file from the returned body substring alone, which
+  // would silently lose anything after the class (APIClientCollection,
+  // etc.) if the offsets and the string it's spliced into ever drifted
+  // apart. The class body's own trailing blank lines are trimmed and
+  // replaced with exactly two (PEP8's own top-level spacing) before
+  // whatever follows - the raw offset otherwise leaves whatever blank-line
+  // count the ORIGINAL file happened to have, which can butt a class header
+  // right up against the adopted methods with zero separation.
+  const beforeBody = hostContent.slice(0, hostClassSource.bodyEnd).replace(/\n+$/, "\n");
+  const afterBody = hostContent.slice(hostClassSource.bodyEnd).replace(/^\n*/, "");
+  const updatedHostContent = `${beforeBody}\n${adoptedSources.join("\n")}\n\n\n${afterBody}`;
+
+  fs.writeFileSync(HOST_MODELS_PATH, updatedHostContent, "utf8");
+  return adopted;
+}
+
 /**
  * Rewrites a module's own placed .py files so they call the host's real
  * collection helper instead of creating and using their own - literal
@@ -123,17 +221,24 @@ function ask(question) {
  * only ever referring to its collection class by the exact name
  * findCollectionClassName would find, which is already a hard requirement
  * for mainPyMerge.mjs's index-creation wiring to work at all.
+ *
+ * Also adopts (see adoptMissingMethods) any method the module calls that
+ * the host doesn't already have, BEFORE rewriting the module's own class
+ * references - method discovery needs the module's ORIGINAL class name
+ * still present in its files to find the call sites at all.
  */
 export function linkToHostCollection(key, manifest, hostEntry) {
   const pkg = backendPackageNameForKey(key, manifest);
   const pkgDir = path.join(BACKEND_DIR, pkg);
   const modelsPath = path.join(pkgDir, "models_mongo.py");
-  if (!fs.existsSync(modelsPath)) return;
+  if (!fs.existsSync(modelsPath)) return { adoptedMethods: [] };
 
   const content = fs.readFileSync(modelsPath, "utf8").replace(/\r\n/g, "\n");
   const collectionClassMatch = content.match(/^class\s+(\w*Collection)\b/m);
-  if (!collectionClassMatch) return;
+  if (!collectionClassMatch) return { adoptedMethods: [] };
   const moduleCollectionClass = collectionClassMatch[1];
+
+  const adoptedMethods = adoptMissingMethods(modelsPath, moduleCollectionClass, hostEntry);
 
   for (const file of fs.readdirSync(pkgDir)) {
     if (!file.endsWith(".py") || file === "models_mongo.py") continue;
@@ -163,6 +268,8 @@ export function linkToHostCollection(key, manifest, hostEntry) {
   // precondition false for every later step that checks for the file's
   // existence rather than re-reading the manifest.
   fs.rmSync(modelsPath, { force: true });
+
+  return { adoptedMethods };
 }
 
 /**
@@ -204,9 +311,15 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
   }
 
   if (confirmed) {
-    linkToHostCollection(key, manifest, result.match);
-    if (!alreadyLinked) console.log(`Linked '${key}' to your existing ${result.match.collectionClass}.`);
-    return { linked: true, report: null };
+    const { adoptedMethods } = linkToHostCollection(key, manifest, result.match);
+    if (!alreadyLinked) {
+      console.log(`Linked '${key}' to your existing ${result.match.collectionClass}.`);
+      if (adoptedMethods.length > 0) {
+        console.log(`  Adopted into ${result.match.collectionClass}: ${adoptedMethods.join(", ")}`);
+        console.log(`  (these are now part of your host's ${result.match.collectionClass} - inspect backend/models_mongo.py)`);
+      }
+    }
+    return { linked: true, report: null, adoptedMethods };
   }
 
   return { linked: false, report: null };

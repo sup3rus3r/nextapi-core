@@ -96,6 +96,21 @@ export function removeModule(id, { purgeEnv = false, force = false } = {}) {
     );
   }
 
+  // Linking a module to a host collection can have adopted (copied) methods
+  // the module called into the HOST's own models_mongo.py - see
+  // collectionSchemaMatch.mjs's adoptMissingMethods. Those methods now live
+  // in a file this function never touches (it only deletes the MODULE's own
+  // package directory), and another module or the user's own code may have
+  // started calling them since - only warn, never auto-delete, same
+  // conservative default as the --purge-env case above.
+  if (entry.adoptedMethods?.length > 0) {
+    console.warn(
+      `\nWarning: '${id}' added these methods to your host's models_mongo.py: ${entry.adoptedMethods.join(", ")}.\n` +
+      `They are NOT being removed automatically (another module or your own code may now depend on them).\n` +
+      `Remove them by hand from backend/models_mongo.py if you're sure nothing else uses them.`
+    );
+  }
+
   console.log(`Removed '${id}'. Restart your dev server to unload its backend code.`);
 }
 

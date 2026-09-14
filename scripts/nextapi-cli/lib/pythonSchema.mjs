@@ -178,3 +178,84 @@ export function parseModuleModelFields(modelsPath) {
 
   return extractFieldsFromCreateSignature(content);
 }
+
+/**
+ * Finds a *Collection helper class's own body in a models_mongo.py file -
+ * the counterpart to findPydanticModelSource, which deliberately EXCLUDES
+ * this same class (see its own "className.endsWith('Collection')" skip).
+ * Used by callers that need to inspect what METHODS a collection class
+ * defines/calls, as opposed to what FIELDS its sibling data model declares.
+ *
+ * `targetName`, when given, requires an EXACT class-name match - needed for
+ * a host file like backend/models_mongo.py that can define more than one
+ * *Collection class (UserCollection, APIClientCollection, ...): a caller
+ * that already knows which one it needs (e.g. hostCollections.mjs's
+ * hostEntry.collectionClass) must never silently get back the wrong one
+ * just because it happens to appear first in the file. Omitted (module-side
+ * callers, where a module's own models_mongo.py has exactly one collection
+ * class by convention) falls back to "the first Collection class found."
+ */
+export function findCollectionClassSource(content, targetName) {
+  content = content.replace(/\r\n/g, "\n");
+  const headers = [...content.matchAll(CLASS_HEADER_RE)];
+  for (let i = 0; i < headers.length; i++) {
+    const [, className] = headers[i];
+    if (!className.endsWith("Collection")) continue;
+    if (targetName && className !== targetName) continue;
+
+    const bodyStart = headers[i].index + headers[i][0].length;
+    const bodyEnd = i + 1 < headers.length ? headers[i + 1].index : content.length;
+    // bodyStart/bodyEnd are byte offsets INTO THE NORMALIZED (\r\n -> \n)
+    // content string above - a caller that needs to splice new content into
+    // this exact class body (e.g. appending an adopted method) must run its
+    // own edit against that same normalized string, never the original
+    // content passed in, or these offsets will be wrong on a CRLF file.
+    return { className, body: content.slice(bodyStart, bodyEnd), bodyStart, bodyEnd };
+  }
+  return null;
+}
+
+// Matches a method header, optionally preceded by a `@classmethod` (or any
+// single decorator) line on the line directly above - group 1 captures the
+// method name. Anchored at exactly 4-space indent, matching this file's
+// established convention (FIELD_LINE_RE, CREATE_METHOD_RE) that every
+// *Collection method is a direct, non-nested member of its class.
+const METHOD_HEADER_RE = /^(?:\s{4}@\w+[^\n]*\n)?\s{4}(?:async\s+)?def\s+(\w+)\s*\(/gm;
+
+/**
+ * Returns the set of every method name defined directly on a *Collection
+ * class's own body (e.g. {"create", "find_by_id", "count", ...}) - the
+ * building block for comparing "what does the HOST already have" against
+ * "what does a linking MODULE actually call," see
+ * sync/collectionSchemaMatch.mjs's method-adoption step.
+ */
+export function listMethodNames(classBody) {
+  return new Set([...classBody.matchAll(METHOD_HEADER_RE)].map((m) => m[1]));
+}
+
+/**
+ * Extracts one named method's full source (decorator line, signature, and
+ * body) from a class body, verbatim, ready to be appended into another
+ * class - the mechanism that lets sync/collectionSchemaMatch.mjs copy a
+ * module's own method implementation into the HOST's real *Collection class
+ * when the module calls a method the host doesn't have (see
+ * collectionSchemaMatch.mjs's adoptMissingMethods for why this is done via
+ * copying source rather than any kind of dynamic dispatch/proxying - the
+ * host's file must remain plain, readable Python with no new indirection).
+ *
+ * Uses the same "next header, or end of class body" boundary technique as
+ * findPydanticModelSource - METHOD_HEADER_RE is anchored to exactly 4-space
+ * indent, so it only ever matches this class's own direct methods, never a
+ * nested function's inner `def` (which would be indented 8+ spaces).
+ */
+export function extractMethodSource(classBody, methodName) {
+  const headers = [...classBody.matchAll(METHOD_HEADER_RE)];
+  for (let i = 0; i < headers.length; i++) {
+    if (headers[i][1] !== methodName) continue;
+
+    const bodyStart = headers[i].index;
+    const bodyEnd = i + 1 < headers.length ? headers[i + 1].index : classBody.length;
+    return classBody.slice(bodyStart, bodyEnd).replace(/\n+$/, "\n");
+  }
+  return null;
+}

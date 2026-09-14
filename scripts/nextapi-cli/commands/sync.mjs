@@ -127,8 +127,14 @@ export async function sync({ yes = false } = {}) {
   for (const key of order) {
     const manifest = manifests.get(key);
     const alreadyLinked = getModuleEntry(lockfile, key)?.linkedCollection === true;
-    const { linked, report } = await resolveCollectionLink(key, manifest, { yes, alreadyLinked });
-    setModuleEntry(lockfile, key, { linkedCollection: linked });
+    const { linked, report, adoptedMethods } = await resolveCollectionLink(key, manifest, { yes, alreadyLinked });
+    const entryUpdate = { linkedCollection: linked };
+    // Only overwrite adoptedMethods when this run actually produced a fresh
+    // list (a re-sync that short-circuits via alreadyLinked never calls
+    // linkToHostCollection again, so adoptedMethods is undefined then - the
+    // previously recorded list must survive untouched, not get wiped to []).
+    if (adoptedMethods !== undefined) entryUpdate.adoptedMethods = adoptedMethods;
+    setModuleEntry(lockfile, key, entryUpdate);
     if (report) unlinkedCollections.push(report);
   }
 
