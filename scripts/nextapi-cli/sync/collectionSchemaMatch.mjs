@@ -36,10 +36,25 @@ function typesCompatible(moduleType, hostType) {
 
 /**
  * Compares a module's own declared Pydantic model fields against a host
- * collection's real fields. Returns { match, compatible, missing } where
- * `missing` lists exactly the fields the module needs that the host
- * collection doesn't have (by name) or has with an incompatible type -
- * actionable for a module author to fix and republish, not just a boolean.
+ * collection's real fields. Returns { match, compatible, missing, extra }.
+ *
+ * `missing` lists only REQUIRED-field problems that actually block linking:
+ * a module field the host doesn't have (or has with an incompatible type)
+ * IS ONLY BLOCKING if that module field is itself required (no default,
+ * not Optional) - a module that merely EXTENDS the host shape with its own
+ * optional extras (e.g. "department", "phone_number") is still perfectly
+ * linkable, since those extra fields simply won't round-trip through the
+ * host collection's own methods. The reverse also matters: if the module
+ * never declares a field the HOST requires (e.g. a model that never sets
+ * hashed_password), calling the host's own create()/etc. through the link
+ * would break at runtime - that's blocking regardless of what the module
+ * itself calls "required."
+ *
+ * `extra` lists non-blocking optional-field mismatches separately, purely
+ * informational (not printed as a blocker anywhere) - kept in the return
+ * shape in case a caller wants to surface "linked, but these fields are
+ * module-only and won't persist" without conflating it with an actual
+ * failure to link.
  */
 export function matchHostCollection(key, manifest) {
   const declaredName = manifest.backend?.collection;
@@ -56,20 +71,35 @@ export function matchHostCollection(key, manifest) {
       match: hostEntry,
       compatible: false,
       missing: [{ field: "(entire model)", moduleType: null, hostType: null, reason: "could not parse the module's Pydantic model" }],
+      extra: [],
     };
   }
 
   const missing = [];
+  const extra = [];
   for (const [name, spec] of Object.entries(moduleFields)) {
     const hostField = hostEntry.fields[name];
-    if (!hostField) {
-      missing.push({ field: name, moduleType: spec.pythonType, hostType: null });
-    } else if (!typesCompatible(spec.pythonType, hostField.pythonType)) {
-      missing.push({ field: name, moduleType: spec.pythonType, hostType: hostField.pythonType });
+    const problem = !hostField
+      ? { field: name, moduleType: spec.pythonType, hostType: null }
+      : !typesCompatible(spec.pythonType, hostField.pythonType)
+        ? { field: name, moduleType: spec.pythonType, hostType: hostField.pythonType }
+        : null;
+    if (!problem) continue;
+    if (spec.optional) extra.push(problem);
+    else missing.push(problem);
+  }
+
+  // A field the HOST requires that the module's own model never declares
+  // at all also blocks linking - the module would call the host's real
+  // create()/etc. without ever supplying that field.
+  for (const [name, hostField] of Object.entries(hostEntry.fields)) {
+    if (hostField.optional) continue;
+    if (!(name in moduleFields)) {
+      missing.push({ field: name, moduleType: null, hostType: hostField.pythonType, reason: `host requires '${name}', module never sets it` });
     }
   }
 
-  return { match: hostEntry, compatible: missing.length === 0, missing };
+  return { match: hostEntry, compatible: missing.length === 0, missing, extra };
 }
 
 function ask(question) {

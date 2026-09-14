@@ -10,26 +10,50 @@ import fs from "node:fs";
 // "incompatible, here's why" report - the correct failure mode is "didn't
 // notice a match," never "silently wrote to the wrong shape."
 
-const CLASS_HEADER_RE = /^class\s+(\w+)\s*\(([^)]*)\)\s*:/gm;
+// Matches both `class Foo(Bar):` and `class Foo:` (no base at all) - a
+// class header is not required to have parentheses in Python, and requiring
+// them here previously meant a class declared without an explicit base
+// (rare, but real) silently failed to match at all.
+const CLASS_HEADER_RE = /^class\s+(\w+)\s*(?:\(([^)]*)\))?\s*:/gm;
 const FIELD_LINE_RE = /^\s{4}(\w+)\s*:\s*([\w\[\].,\s|]+?)(?:\s*=.*)?$/;
 
 /**
- * Finds the Pydantic model class in a models_mongo.py file - the sibling of
+ * Finds the data-model class in a models_mongo.py file - the sibling of
  * whatever findCollectionClassName finds (e.g. UserMongo next to
- * UserCollection): a class whose base includes "BaseModel" and whose name
- * does NOT end in "Collection".
+ * UserCollection).
+ *
+ * Deliberately does NOT require the literal string "BaseModel" in the base
+ * class list - a real published module inheriting from a shared/aliased
+ * base (e.g. `class Foo(MongoBaseModel):`, or `BaseModel` imported under a
+ * different name) would otherwise be silently rejected outright, which is
+ * worse than the false positive this guards against: a module that isn't
+ * even trying to be a Pydantic model wouldn't have FIELD_LINE_RE-shaped
+ * lines in its body anyway, so requiring at least one such line is a more
+ * reliable "is this actually a data model" signal than string-matching the
+ * inheritance clause. Only real exclusion is by name - a class ending in
+ * "Collection" is always the helper, never the model, by this codebase's
+ * own established convention (see findCollectionClassName in
+ * mainPyMerge.mjs, which already relies on the same naming rule).
  */
 export function findPydanticModelSource(content) {
   content = content.replace(/\r\n/g, "\n");
   const headers = [...content.matchAll(CLASS_HEADER_RE)];
   for (let i = 0; i < headers.length; i++) {
-    const [, className, bases] = headers[i];
+    const [, className] = headers[i];
     if (className.endsWith("Collection")) continue;
-    if (!/\bBaseModel\b/.test(bases)) continue;
 
     const bodyStart = headers[i].index + headers[i][0].length;
     const bodyEnd = i + 1 < headers.length ? headers[i + 1].index : content.length;
-    return { className, body: content.slice(bodyStart, bodyEnd) };
+    const body = content.slice(bodyStart, bodyEnd);
+
+    // Require at least one real field-shaped line - this is what actually
+    // distinguishes a data model from an unrelated helper/exception/mixin
+    // class that happens to live in the same file and isn't named
+    // *Collection (e.g. a custom ObjectId wrapper like PyObjectId above).
+    const hasFieldLine = body.split("\n").some((line) => FIELD_LINE_RE.test(line));
+    if (!hasFieldLine) continue;
+
+    return { className, body };
   }
   return null;
 }
