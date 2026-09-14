@@ -324,6 +324,41 @@ existing UserCollection. Link it instead of creating a separate collection? (y/N
                 <code className="text-foreground">scripts/nextapi-cli/lib/hostCollections.mjs</code>) - a module
                 targeting anything else installs exactly as it always has.
               </p>
+              <p>
+                Matching fields isn&apos;t the whole story. A module can also call methods on its collection
+                class (<code className="text-foreground">UserCollection.count(...)</code>,{" "}
+                <code className="text-foreground">.list_page(...)</code>) that your real{" "}
+                <code className="text-foreground">UserCollection</code> doesn&apos;t have. When that happens,
+                sync copies the module&apos;s own implementation of exactly those methods into your real{" "}
+                <code className="text-foreground">models_mongo.py</code> - purely additive, never touching or
+                overwriting a method your host already has, since something else (like{" "}
+                <code className="text-foreground">/auth/register</code>) may already depend on it behaving
+                exactly as it does today:
+              </p>
+              <CodeBlock>{`Linked '@alice/user-management' to your existing UserCollection.
+  Adopted into UserCollection: count, list_page
+  (these are now part of your host's UserCollection - inspect backend/models_mongo.py)`}</CodeBlock>
+              <p>
+                Field compatibility also can&apos;t catch data that predates the field: your{" "}
+                <code className="text-foreground">users</code> collection may hold documents written before a
+                field existed on your model, especially if that model was never enforced on every write path.
+                Sync samples your actual MongoDB collection at link time and, if a field your model declares
+                required is missing from real, existing documents, asks explicit consent before demoting that
+                field to optional in your host&apos;s schema:
+              </p>
+              <CodeBlock>{`'users' collection: 'created_at' is declared required, but missing from
+214/1,048 existing documents. Demote 'created_at' to optional in your
+host's UserMongo model to match reality? (y/N)`}</CodeBlock>
+              <div className="rounded-xl border border-border bg-card p-5">
+                <p className="text-sm font-semibold text-foreground">Declining a demotion</p>
+                <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                  Aborts the entire link for that module - nothing is written to{" "}
+                  <code className="text-foreground">models_mongo.py</code>, and the module falls back to its own
+                  separate collection, same as an incompatible-fields case. This check needs your backend&apos;s
+                  Mongo reachable from the machine running sync; if it isn&apos;t, sync skips it silently and
+                  links exactly as it would have before this check existed.
+                </p>
+              </div>
               <div className="rounded-xl border border-border bg-card p-5">
                 <p className="text-sm font-semibold text-foreground">Building a module that manages users?</p>
                 <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
@@ -331,7 +366,12 @@ existing UserCollection. Link it instead of creating a separate collection? (y/N
                   <code className="text-foreground">username</code>, <code className="text-foreground">email</code>,{" "}
                   <code className="text-foreground">role</code>, and{" "}
                   <code className="text-foreground">hashed_password</code> links cleanly instead of falling through
-                  to its own disconnected collection.
+                  to its own disconnected collection. And once linked, don&apos;t assume every existing document
+                  has every field: read anything sourced from a host-owned collection with{" "}
+                  <code className="text-foreground">doc.get(&quot;field&quot;)</code>, not{" "}
+                  <code className="text-foreground">doc[&quot;field&quot;]</code>, and type it{" "}
+                  <code className="text-foreground">Optional[...]</code> in your response schema - the host&apos;s
+                  real data can predate your module by years.
                 </p>
               </div>
               <p>

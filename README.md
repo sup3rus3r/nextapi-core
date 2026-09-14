@@ -155,7 +155,25 @@ The decision is remembered. Installing a new version of an already-linked module
 
 This only recognizes collections this starter itself ships (`users`, in `scripts/nextapi-cli/lib/hostCollections.mjs`) - a module targeting anything else installs exactly as it always has.
 
-**If you're building a module that manages users** (or anything else the host already models), match the host's real field names and types up front - a module modeling `username`, `email`, `role`, and `hashed_password` against `UserMongo`'s actual shape links cleanly instead of falling through to its own disconnected collection.
+**Method adoption.** Matching fields isn't enough on its own - a module can also call methods on its collection class (`UserCollection.count(...)`, `.list_page(...)`) that your real `UserCollection` doesn't have. When that happens, `sync` copies the module's own implementation of those specific methods into your real `models_mongo.py`, purely additive - it never touches or overwrites a method your host already has, since something else (like `/auth/register`) may already depend on it behaving exactly as it does today:
+
+```
+Linked '@alice/user-management' to your existing UserCollection.
+  Adopted into UserCollection: count, list_page
+  (these are now part of your host's UserCollection - inspect backend/models_mongo.py)
+```
+
+**Real-data field checks.** A field can be compatible on paper and still not match reality: your `users` collection may hold documents written before a field existed on your model, especially if the model itself was never enforced on every write path. `sync` samples your actual MongoDB collection at link time and, if a field your model declares required is missing from real, existing documents, asks explicit consent before demoting that field to optional in your host's schema:
+
+```
+'users' collection: 'created_at' is declared required, but missing from
+214/1,048 existing documents. Demote 'created_at' to optional in your
+host's UserMongo model to match reality? (y/N)
+```
+
+Declining aborts the entire link for that module - nothing is written, and it falls back to its own separate collection, same as an incompatible-fields case. Accepting mutates only the type annotation (`datetime` becomes `Optional[datetime]`), keeping whatever default your model already had. This check requires your backend's Mongo to be reachable from the machine running `sync` - if it isn't, `sync` skips it silently and links exactly as it would have before this check existed.
+
+**If you're building a module that manages users** (or anything else the host already models), match the host's real field names and types up front - a module modeling `username`, `email`, `role`, and `hashed_password` against `UserMongo`'s actual shape links cleanly instead of falling through to its own disconnected collection. And once linked, don't assume every existing document has every field: read anything that came from a host-owned collection with `doc.get("field")`, not `doc["field"]`, and type it `Optional[...]` in your response schema - the host's real data can predate your module by years.
 
 **Installing a public module that doesn't link?** Fork it - either by hand, or by handing the field-mismatch report to the AI Builder and asking it to update the module's model to match - then republish. A module that links correctly today keeps linking for everyone who installs it after you.
 
