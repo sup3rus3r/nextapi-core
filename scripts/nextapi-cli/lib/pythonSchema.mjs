@@ -81,15 +81,100 @@ export function extractFields(classBody) {
   return fields;
 }
 
+const CREATE_METHOD_RE = /^\s{4}(?:async\s+)?def\s+create\s*\(/m;
+const PARAM_RE = /^(\w+)\s*:\s*([\w\[\].,\s|]+?)(?:\s*=\s*(.*))?$/;
+
+/**
+ * A real, published module doesn't always model its document with a
+ * Pydantic class - core's OWN real UserCollection (backend/models_mongo.py)
+ * only ever takes/returns plain dicts too, and a module can legitimately be
+ * written the same way: a single *Collection class with classmethods, no
+ * separate schema layer at all (confirmed against a real published module
+ * that does exactly this, matching the host's own style deliberately). For
+ * a module shaped like that, the closest thing to a field list is its own
+ * create() classmethod's parameter list - the keyword parameters (beyond
+ * the leading cls/db) it accepts to build a new document, with a default
+ * value marking a parameter optional the same way Optional[]/Field(...)
+ * does for a Pydantic field.
+ *
+ * This is intentionally a fallback checked only when no Pydantic model was
+ * found (see parseModuleModelFields) - a module that HAS a real Pydantic
+ * model is still parsed from that, since it's the more precise, structured
+ * source of truth when one exists.
+ */
+export function extractFieldsFromCreateSignature(content) {
+  content = content.replace(/\r\n/g, "\n");
+  const match = content.match(CREATE_METHOD_RE);
+  if (!match) return null;
+
+  // Find the matching close-paren by tracking depth char-by-char from the
+  // open-paren onward - the signature spans multiple lines with nested
+  // [...] in type annotations, so a line-based regex can't safely find
+  // where the parameter list actually ends.
+  const openParenIndex = content.indexOf("(", match.index);
+  let depth = 0;
+  let closeParenIndex = -1;
+  for (let i = openParenIndex; i < content.length; i++) {
+    if (content[i] === "(") depth++;
+    else if (content[i] === ")") {
+      depth--;
+      if (depth === 0) {
+        closeParenIndex = i;
+        break;
+      }
+    }
+  }
+  if (closeParenIndex === -1) return null;
+
+  const paramList = content.slice(openParenIndex + 1, closeParenIndex);
+  // Split on top-level commas only - a comma inside a type annotation's
+  // own [...] (e.g. "Dict[str, int]") must not split the parameter list.
+  const params = [];
+  let current = "";
+  let bracketDepth = 0;
+  for (const ch of paramList) {
+    if (ch === "[") bracketDepth++;
+    else if (ch === "]") bracketDepth--;
+    if (ch === "," && bracketDepth === 0) {
+      params.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) params.push(current);
+
+  const fields = {};
+  for (const rawParam of params) {
+    const trimmed = rawParam.trim().replace(/\n/g, " ").replace(/\s+/g, " ");
+    if (!trimmed || trimmed === "cls" || trimmed === "db") continue;
+    const paramMatch = trimmed.match(PARAM_RE);
+    if (!paramMatch) continue; // an untyped param (rare, and unusable as a field spec) - skip rather than guess
+
+    const [, name, rawType, defaultValue] = paramMatch;
+    const pythonType = rawType.trim().replace(/^Optional\[(.+)\]$/, "$1");
+    const optional = /^Optional\[/.test(rawType.trim()) || defaultValue !== undefined;
+    fields[name] = { pythonType, optional };
+  }
+
+  return Object.keys(fields).length > 0 ? fields : null;
+}
+
 /**
  * Reads a module's placed models_mongo.py (post-placement, under
- * backend/<pkg>/models_mongo.py) and returns its Pydantic model's fields, or
- * null if the file doesn't exist or no matching class is found.
+ * backend/<pkg>/models_mongo.py) and returns its document's fields, or null
+ * if the file doesn't exist or no field source could be found. Tries a
+ * Pydantic model first (the more precise, structured source when one
+ * exists), then falls back to a dict-based *Collection class's own
+ * create() signature - see extractFieldsFromCreateSignature for why that
+ * fallback is necessary at all.
  */
 export function parseModuleModelFields(modelsPath) {
   if (!fs.existsSync(modelsPath)) return null;
   const content = fs.readFileSync(modelsPath, "utf8");
+
   const found = findPydanticModelSource(content);
-  if (!found) return null;
-  return extractFields(found.body);
+  if (found) return extractFields(found.body);
+
+  return extractFieldsFromCreateSignature(content);
 }
