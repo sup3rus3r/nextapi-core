@@ -1,0 +1,15 @@
+{
+  "_comment": "The fixed set of @/components/ui/* primitives every published module is written against (see nextapi_module_factory's builder skill_prompt.py, 'these are the only @/components/ui/* paths that actually exist on the host'). `sync` ensures every file here exists in the target project's frontend/components/ui/ before placing module files, self-healing starters (like this one) that don't ship the full canonical set yet. Do not add files here for anything module-specific - only genuinely universal shadcn/ui primitives every host is expected to provide.",
+  "components": {
+    "avatar": { "npm": ["@radix-ui/react-avatar"] },
+    "button": { "npm": ["@radix-ui/react-slot", "class-variance-authority"] },
+    "card": { "npm": [] },
+    "dialog": { "npm": ["@radix-ui/react-dialog"] },
+    "alert-dialog": { "npm": ["@radix-ui/react-alert-dialog"] },
+    "input": { "npm": [] },
+    "label": { "npm": ["@radix-ui/react-label"] },
+    "switch": { "npm": ["@radix-ui/react-switch"] },
+    "tabs": { "npm": ["@radix-ui/react-tabs"] },
+    "textarea": { "npm": [] }
+  }
+}

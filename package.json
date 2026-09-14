@@ -1,0 +1,27 @@
+{
+  "name": "nextapi",
+  "version": "1.0.0",
+  "description": "A FastAPI and Next.js starter, extended by a module registry.",
+  "main": "index.js",
+  "bin": {
+    "nextapi": "./scripts/nextapi-cli/cli.mjs"
+  },
+  "scripts": {
+    "dev": "concurrently \"npm run dev --prefix frontend\" \"npm run api\"",
+    "api": "cd backend && uv run uvicorn main:app",
+    "add:mobile": "node scripts/add-mobile.mjs",
+    "setup": "node scripts/setup-env.mjs",
+    "init:blank": "node scripts/init-blank.mjs",
+    "nextapi": "node scripts/nextapi-cli/cli.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.18",
+    "concurrently": "^9.2.1",
+    "tailwindcss": "^4.1.18",
+    "ts-morph": "^28.0.0"
+  }
+}

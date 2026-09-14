@@ -1,0 +1,10 @@
+{
+  "capabilities": {
+    "auth.get_current_user": { "since": "1.0.0", "kind": "python-callable", "import": "auth.get_current_user" },
+    "auth.get_current_user_or_api_client": { "since": "1.0.0", "kind": "python-callable", "import": "auth.get_current_user_or_api_client" },
+    "crypto.decrypt_payload": { "since": "1.0.0", "kind": "python-callable", "import": "crypto_utils.decrypt_payload" },
+    "db_mongo.get_database": { "since": "1.0.0", "kind": "python-callable", "import": "database_mongo.get_database" },
+    "api.apiFetch": { "since": "1.0.0", "kind": "ts-callable", "import": "@/lib/api#apiFetch" },
+    "rbac.hasAccess": { "since": "1.0.0", "kind": "ts-callable", "import": "@/config/routes#hasAccess" }
+  }
+}
