@@ -259,3 +259,72 @@ export function extractMethodSource(classBody, methodName) {
   }
   return null;
 }
+
+/**
+ * Rewrites one field line inside a named Pydantic model's class body (as
+ * found by findPydanticModelSource) so its type annotation becomes
+ * Optional[...] - the mechanism behind collectionSchemaMatch.mjs's real-data
+ * demotion-consent flow: a host-required field can be declared non-optional
+ * in the Pydantic model while real, pre-existing documents in the actual
+ * collection are missing it entirely (the type declaration and the real
+ * data have already drifted apart) - this is the fix path a user explicitly
+ * consents to, mutating the host's own schema so it stops lying instead of
+ * papering over the gap in whichever module happened to hit it first.
+ *
+ * Operates on `content` (the FULL FILE, already \r\n -> \n normalized) and a
+ * `fieldName`, re-locating the field's line by re-running
+ * findPydanticModelSource rather than accepting a pre-sliced body + offset -
+ * a caller may need to apply this alongside a method-adoption edit in the
+ * same write pass (see collectionSchemaMatch.mjs's applyLinkPlan), and
+ * re-finding by content keeps this function self-contained and safe to call
+ * repeatedly against a content string that's being edited in place across
+ * several fields.
+ *
+ * Three cases, matching this file's existing field-shape vocabulary
+ * (extractFields' own Optional[...]/=None/Field(...) recognition):
+ *
+ *   1. Already `Optional[X]` (however defaulted) - no-op, returns content
+ *      unchanged. Idempotent by design: calling this twice (e.g. a re-sync
+ *      re-discovering the same already-demoted field) must never corrupt
+ *      the file into Optional[Optional[X]].
+ *
+ *   2. `name: X` with NO default at all - becomes
+ *      `name: Optional[X] = None`.
+ *
+ *   3. `name: X = <anything>` (Field(...), a literal, default_factory, etc)
+ *      - becomes `name: Optional[X] = <anything>`: only the type annotation
+ *      is wrapped, whatever already followed `=` is preserved verbatim. The
+ *      point of demotion is purely the STATIC TYPE no longer promising "this
+ *      key always exists," not changing what value gets used when present.
+ *
+ * Returns the rewritten content string, or null if the named class or field
+ * line couldn't be found at all - the caller must treat null as "could not
+ * safely mutate" and abort that field's demotion rather than silently
+ * reporting success while nothing actually changed.
+ */
+export function demoteFieldToOptional(content, className, fieldName) {
+  const found = findPydanticModelSource(content);
+  if (!found || found.className !== className) return null;
+
+  const lines = content.split("\n");
+  const before = content.slice(0, content.indexOf(found.body));
+  const startLine = before.split("\n").length - 1;
+  const bodyLineCount = found.body.split("\n").length;
+
+  for (let i = startLine; i < startLine + bodyLineCount; i++) {
+    const line = lines[i];
+    if (line === undefined) break;
+    const match = line.match(/^(\s{4})(\w+)\s*:\s*([\w\[\].,\s|]+?)(\s*=.*)?$/);
+    if (!match || match[2] !== fieldName) continue;
+
+    const [, indent, name, rawType, rawDefault] = match;
+    const trimmedType = rawType.trim();
+    if (/^Optional\[/.test(trimmedType)) return content; // already optional - no-op
+
+    const newType = `Optional[${trimmedType}]`;
+    const newDefault = rawDefault !== undefined ? rawDefault : " = None";
+    lines[i] = `${indent}${name}: ${newType}${newDefault}`;
+    return lines.join("\n");
+  }
+  return null;
+}

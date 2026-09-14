@@ -18,6 +18,17 @@ export const HOST_COLLECTIONS = {
   users: {
     // The real classmethod-holding class in the host's own models_mongo.py.
     collectionClass: "UserCollection",
+    // The sibling Pydantic model class in the same file - the target of
+    // sync/collectionSchemaMatch.mjs's real-data field-demotion mutation
+    // (lib/pythonSchema.mjs's demoteFieldToOptional operates on THIS class,
+    // never on collectionClass, since collectionClass only ever holds
+    // classmethods, no field declarations of its own).
+    modelClass: "UserMongo",
+    // The REAL Mongo collection name (mirrors UserCollection.collection_name
+    // in models_mongo.py) - used by lib/mongoSample.mjs's sampleFieldPresence
+    // to sample the actual live collection, distinct from a MODULE's own
+    // declared/namespaced collection name.
+    collectionName: "users",
     // Relative to BACKEND_DIR - the host's own file, never a module's copy.
     modelsPath: "models_mongo.py",
     // Mirrors backend/models_mongo.py's real UserMongo field list exactly.

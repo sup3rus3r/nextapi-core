@@ -6,10 +6,14 @@ import { backendPackageNameForKey } from "../lib/moduleId.mjs";
 import { findHostCollection } from "../lib/hostCollections.mjs";
 import {
   parseModuleModelFields,
+  findPydanticModelSource,
+  extractFields,
   findCollectionClassSource,
   listMethodNames,
   extractMethodSource,
+  demoteFieldToOptional,
 } from "../lib/pythonSchema.mjs";
+import { sampleFieldPresence } from "../lib/mongoSample.mjs";
 
 // A module that declares backend.collection today always gets its OWN,
 // fully disconnected Mongo collection (namespaced per module, per
@@ -142,17 +146,16 @@ function findCalledMethods(pkgDir, moduleCollectionClass) {
 }
 
 /**
- * For every method the module calls that the HOST's real collection class
- * doesn't already have, copies that method's implementation (verbatim, from
- * the module's OWN models_mongo.py) into the host's real file as a new
- * method on the host's real class - purely additive, never touching or
- * replacing any method the host already has (see module-level comment: a
- * same-named host method is always assumed authoritative, this only ever
- * ADDS names that didn't exist before). Returns the list of method names
- * actually adopted, for the caller to record on the lockfile entry and
- * report to the user - writing into the host's own backend file is a
- * materially bigger deal than the field-linking decision and must never be
- * silent.
+ * Computes (WITHOUT writing anything) the methods a module calls that the
+ * HOST's real collection class doesn't already have, along with each one's
+ * source extracted verbatim from the module's OWN models_mongo.py - purely
+ * additive by construction, never touching or replacing any method the host
+ * already has (a same-named host method is always assumed authoritative,
+ * this only ever proposes ADDING names that didn't exist before). Returns
+ * `[{ name, source }]`, for the caller to fold into a link plan that isn't
+ * written to disk until every consent it needs (this, plus any field
+ * demotions from planFieldDemotions) has been collected - see
+ * resolveCollectionLink and applyLinkPlan.
  *
  * KNOWN LIMITATION, disclosed rather than silently assumed away: this is
  * purely name-based, exactly like the field-compatibility check above. If
@@ -165,7 +168,7 @@ function findCalledMethods(pkgDir, moduleCollectionClass) {
  * behavior guarantee) rather than overclaiming a safety property this
  * mechanism can't actually provide.
  */
-function adoptMissingMethods(moduleModelsPath, moduleCollectionClass, hostEntry) {
+function planMethodAdoptions(moduleModelsPath, moduleCollectionClass, hostEntry) {
   const moduleContent = fs.readFileSync(moduleModelsPath, "utf8").replace(/\r\n/g, "\n");
   const moduleClassSource = findCollectionClassSource(moduleContent, moduleCollectionClass);
   if (!moduleClassSource) return [];
@@ -181,33 +184,187 @@ function adoptMissingMethods(moduleModelsPath, moduleCollectionClass, hostEntry)
   const toAdopt = [...calledMethods].filter((name) => !hostMethods.has(name));
   if (toAdopt.length === 0) return [];
 
-  const adopted = [];
-  const adoptedSources = [];
+  const planned = [];
   for (const name of toAdopt) {
     const source = extractMethodSource(moduleClassSource.body, name);
     if (!source) continue; // module calls a name it doesn't itself define - nothing to adopt, nothing to report
-    adopted.push(name);
-    adoptedSources.push(source);
+    planned.push({ name, source });
   }
-  if (adopted.length === 0) return [];
+  return planned;
+}
 
-  // Splice the new methods in right at the end of the host class's own
-  // body, using the REAL byte offset findCollectionClassSource already
-  // computed against this exact normalized hostContent string - never
-  // reconstruct the file from the returned body substring alone, which
-  // would silently lose anything after the class (APIClientCollection,
-  // etc.) if the offsets and the string it's spliced into ever drifted
-  // apart. The class body's own trailing blank lines are trimmed and
-  // replaced with exactly two (PEP8's own top-level spacing) before
-  // whatever follows - the raw offset otherwise leaves whatever blank-line
-  // count the ORIGINAL file happened to have, which can butt a class header
-  // right up against the adopted methods with zero separation.
+/**
+ * Splices already-planned method sources onto the end of a host class body
+ * within an in-memory content string - the actual mutation, split out from
+ * planMethodAdoptions so it can run as part of the single shared write gate
+ * (applyLinkPlan) alongside any field demotions, rather than writing to
+ * HOST_MODELS_PATH on its own. Returns the updated content string; does NOT
+ * write to disk itself.
+ */
+function applyMethodAdoptions(hostContent, hostClassSource, adoptedSources) {
+  // The class body's own trailing blank lines are trimmed and replaced with
+  // exactly two (PEP8's own top-level spacing) before whatever follows - the
+  // raw offset otherwise leaves whatever blank-line count the ORIGINAL file
+  // happened to have, which can butt a class header right up against the
+  // adopted methods with zero separation.
   const beforeBody = hostContent.slice(0, hostClassSource.bodyEnd).replace(/\n+$/, "\n");
   const afterBody = hostContent.slice(hostClassSource.bodyEnd).replace(/^\n*/, "");
-  const updatedHostContent = `${beforeBody}\n${adoptedSources.join("\n")}\n\n\n${afterBody}`;
+  return `${beforeBody}\n${adoptedSources.join("\n")}\n\n\n${afterBody}`;
+}
 
-  fs.writeFileSync(HOST_MODELS_PATH, updatedHostContent, "utf8");
-  return adopted;
+/**
+ * Determines which of the host's fields are ACTUALLY required by
+ * re-parsing the host's own live Pydantic model (findPydanticModelSource +
+ * extractFields against the real, current backend/models_mongo.py) rather
+ * than trusting HOST_COLLECTIONS' hand-maintained `optional` flags.
+ *
+ * This distinction is not academic - it was caught live while testing this
+ * exact feature: HOST_COLLECTIONS.users.fields already marks `created_at`
+ * as `optional: true`, but the REAL UserMongo class declares
+ * `created_at: datetime` with no Optional[...] wrapper at all. Trusting the
+ * hand-maintained map would have made planFieldDemotions silently skip
+ * sampling the ONE field that caused the real production crash this whole
+ * feature exists to catch - the map itself is exactly the kind of
+ * declared-schema source this feature is supposed to stop trusting blindly.
+ * Falls back to hostEntry.fields' own `optional` flags only if the live
+ * model can't be found/parsed at all (e.g. hand-edited into an unparseable
+ * shape) - degrading to the previous behavior rather than crashing.
+ */
+function findRequiredHostFields(hostEntry) {
+  const hostContent = fs.readFileSync(HOST_MODELS_PATH, "utf8").replace(/\r\n/g, "\n");
+  const modelSource = findPydanticModelSource(hostContent);
+  if (!modelSource || modelSource.className !== hostEntry.modelClass) {
+    return Object.entries(hostEntry.fields)
+      .filter(([, spec]) => !spec.optional)
+      .map(([name]) => name);
+  }
+
+  const liveFields = extractFields(modelSource.body);
+  return Object.keys(hostEntry.fields).filter((name) => {
+    const liveField = liveFields[name];
+    // A field the live model doesn't even declare can't be judged required
+    // by this check - matchHostCollection's own declared-schema comparison
+    // already covers that case separately.
+    if (!liveField) return false;
+    return !liveField.optional;
+  });
+}
+
+/**
+ * For every field the host's own LIVE Pydantic model actually declares
+ * required (see findRequiredHostFields - re-parsed from the real file, not
+ * the hand-maintained HOST_COLLECTIONS map), samples the host's REAL, live
+ * MongoDB collection to see how many existing documents are actually
+ * missing that field. The declared-schema comparison in matchHostCollection
+ * only ever compares one schema declaration against another (the module's
+ * model vs. HOST_COLLECTIONS' hand-maintained field map), which says
+ * nothing about whether the host's OWN real data actually matches its OWN
+ * model. This is what a purely static/declared check can never catch: a
+ * collection's real data can silently drift from its declared model over
+ * the app's life (fields added to the model after real rows were already
+ * written by a native code path that builds its insert dict by hand, see
+ * this module's own doc comment on the incident that motivated this).
+ *
+ * Returns `[{ field, hostType, missingCount, totalCount }]` for every
+ * required field with a real gap - empty (never throws, never blocks a
+ * link on its own) when sampling is unavailable (Mongo down/unreachable,
+ * see lib/mongoSample.mjs's own fail-soft contract) or finds nothing wrong.
+ * This function's whole contract is "only ever ADD friction via an explicit
+ * consent prompt downstream, never introduce a new way to silently block or
+ * silently allow a link that would otherwise have gone through before this
+ * feature existed."
+ */
+async function planFieldDemotions(hostEntry) {
+  const requiredFields = findRequiredHostFields(hostEntry);
+  if (requiredFields.length === 0) return [];
+
+  const sample = await sampleFieldPresence(hostEntry.collectionName, requiredFields);
+  if (!sample) return [];
+
+  const demotions = [];
+  for (const field of requiredFields) {
+    const missingCount = sample.missingCounts[field];
+    if (missingCount > 0) {
+      demotions.push({ field, hostType: hostEntry.fields[field]?.pythonType ?? null, missingCount, totalCount: sample.totalCount });
+    }
+  }
+  return demotions;
+}
+
+/**
+ * Asks one explicit consent question per field that real-data sampling
+ * found genuinely missing from existing documents - separate from the
+ * existing "link this module?" prompt and separate from method adoption
+ * (which is reported, not separately asked, since it can never remove or
+ * change the meaning of anything the host already had). Mutating the host's
+ * own schema type is a bigger deal than adding a method, so it gets its own,
+ * itemized, per-field question rather than being folded into a bundle.
+ *
+ * Stops at the first decline - per resolveCollectionLink's contract, ANY
+ * decline aborts the WHOLE link (no partial demotions applied), so there is
+ * no reason to keep asking once one has already failed. Returns
+ * { allConsented, consented } - `consented` is only ever a strict prefix of
+ * `demotions` (whatever was agreed to before the first decline, if any);
+ * the caller must treat `allConsented: false` as "apply none of them," not
+ * "apply the partial prefix."
+ */
+async function collectFieldDemotionConsent(hostEntry, demotions) {
+  const consented = [];
+  for (const demotion of demotions) {
+    const { field, missingCount, totalCount } = demotion;
+    const answer = await ask(
+      `'${hostEntry.collectionName}' collection: '${field}' is declared required, but missing from ` +
+      `${missingCount.toLocaleString()}/${totalCount.toLocaleString()} existing documents. Demote '${field}' to ` +
+      `optional in your host's ${hostEntry.modelClass} model to match reality? (y/N) `
+    );
+    if (answer !== "y" && answer !== "yes") return { allConsented: false, consented };
+    consented.push(demotion);
+  }
+  return { allConsented: true, consented };
+}
+
+/**
+ * The ONLY place either a method adoption or a field demotion actually
+ * touches HOST_MODELS_PATH. Called exactly once, only after every consent
+ * this module's link needs has already been collected (resolveCollectionLink
+ * never calls this until the top-level link confirmation AND every field
+ * demotion consent have all succeeded) - by construction, nothing upstream
+ * of this function may write to the host's file, so a decline anywhere
+ * upstream leaves the host's real backend/models_mongo.py byte-for-byte
+ * untouched.
+ *
+ * Reads the host file fresh (not any copy read earlier during planning,
+ * which may already be stale if this same sync run already wrote to it for
+ * an EARLIER module in the sync order), applies method adoptions first,
+ * then field demotions, against the SAME in-memory content string, and
+ * writes once.
+ */
+function applyLinkPlan(hostEntry, plan) {
+  let hostContent = fs.readFileSync(HOST_MODELS_PATH, "utf8").replace(/\r\n/g, "\n");
+
+  if (plan.methodAdoptions.length > 0) {
+    const hostClassSource = findCollectionClassSource(hostContent, hostEntry.collectionClass);
+    if (hostClassSource) {
+      hostContent = applyMethodAdoptions(
+        hostContent,
+        hostClassSource,
+        plan.methodAdoptions.map((m) => m.source)
+      );
+    }
+  }
+
+  for (const { field } of plan.fieldDemotions) {
+    const updated = demoteFieldToOptional(hostContent, hostEntry.modelClass, field);
+    // If the field line vanished between planning and now (the host file
+    // was hand-edited mid-run, or an earlier module's write in this same
+    // sync somehow removed it) skip it rather than throw - the method
+    // adoptions and any other demotions in this same write still proceed;
+    // a demotion that can no longer find its target field is a no-op, not
+    // a fatal error for the rest of the plan.
+    if (updated) hostContent = updated;
+  }
+
+  fs.writeFileSync(HOST_MODELS_PATH, hostContent, "utf8");
 }
 
 /**
@@ -222,23 +379,25 @@ function adoptMissingMethods(moduleModelsPath, moduleCollectionClass, hostEntry)
  * findCollectionClassName would find, which is already a hard requirement
  * for mainPyMerge.mjs's index-creation wiring to work at all.
  *
- * Also adopts (see adoptMissingMethods) any method the module calls that
- * the host doesn't already have, BEFORE rewriting the module's own class
- * references - method discovery needs the module's ORIGINAL class name
- * still present in its files to find the call sites at all.
+ * Takes an already-built, already-fully-consented `plan` (see
+ * resolveCollectionLink) - this function itself never asks anything and
+ * never decides what to adopt/demote, it only applies the plan (via
+ * applyLinkPlan) and then does the module's own file rewrite/delete, which
+ * is covered by the module's own top-level link consent, not by the
+ * host-file consent the plan itself required to be fully built.
  */
-export function linkToHostCollection(key, manifest, hostEntry) {
+export function linkToHostCollection(key, manifest, hostEntry, plan) {
   const pkg = backendPackageNameForKey(key, manifest);
   const pkgDir = path.join(BACKEND_DIR, pkg);
   const modelsPath = path.join(pkgDir, "models_mongo.py");
-  if (!fs.existsSync(modelsPath)) return { adoptedMethods: [] };
+  if (!fs.existsSync(modelsPath)) return;
+
+  applyLinkPlan(hostEntry, plan);
 
   const content = fs.readFileSync(modelsPath, "utf8").replace(/\r\n/g, "\n");
   const collectionClassMatch = content.match(/^class\s+(\w*Collection)\b/m);
-  if (!collectionClassMatch) return { adoptedMethods: [] };
+  if (!collectionClassMatch) return;
   const moduleCollectionClass = collectionClassMatch[1];
-
-  const adoptedMethods = adoptMissingMethods(modelsPath, moduleCollectionClass, hostEntry);
 
   for (const file of fs.readdirSync(pkgDir)) {
     if (!file.endsWith(".py") || file === "models_mongo.py") continue;
@@ -268,22 +427,29 @@ export function linkToHostCollection(key, manifest, hostEntry) {
   // precondition false for every later step that checks for the file's
   // existence rather than re-reading the manifest.
   fs.rmSync(modelsPath, { force: true });
-
-  return { adoptedMethods };
 }
 
 /**
  * Runs the full link-or-report flow for one module. Returns
  * { linked: boolean, report } - `report` is set ({ id, hostCollection,
- * missing }) when the module was left unlinked (incompatible, or the user
- * declined), for sync.mjs to print an end-of-run summary; `linked` tells
- * sync.mjs whether to persist the decision on the module's lockfile entry
- * so a later re-sync (e.g. installing a new version of an already-linked
- * module) doesn't ask again - see the `alreadyLinked` param below for why
- * that's necessary at all: placeModuleFiles re-copies a fresh
- * models_mongo.py from the newly staged version on every sync, regardless
- * of whether the PREVIOUS version was linked, so file presence alone can't
- * distinguish "never asked" from "already said yes last time."
+ * missing }) when the module was left unlinked (incompatible, the user
+ * declined the link, or the user declined a field-demotion consent), for
+ * sync.mjs to print an end-of-run summary; `linked` tells sync.mjs whether
+ * to persist the decision on the module's lockfile entry so a later re-sync
+ * (e.g. installing a new version of an already-linked module) doesn't ask
+ * again - see the `alreadyLinked` param below for why that's necessary at
+ * all: placeModuleFiles re-copies a fresh models_mongo.py from the newly
+ * staged version on every sync, regardless of whether the PREVIOUS version
+ * was linked, so file presence alone can't distinguish "never asked" from
+ * "already said yes last time."
+ *
+ * Nothing is written to the host's backend/models_mongo.py until EVERY
+ * consent this module's link needs has been collected - method adoptions
+ * and field demotions are both computed (read-only) up front into a single
+ * plan, and applyLinkPlan (inside linkToHostCollection) is the only call
+ * that ever writes, called only after the link is confirmed AND every field
+ * demotion is consented to. A decline anywhere in that sequence returns
+ * before any write happens, so there is no partial state to roll back.
  */
 export async function resolveCollectionLink(key, manifest, { yes = false, alreadyLinked = false } = {}) {
   const result = matchHostCollection(key, manifest);
@@ -302,6 +468,21 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
     };
   }
 
+  const pkg = backendPackageNameForKey(key, manifest);
+  const modelsPath = path.join(BACKEND_DIR, pkg, "models_mongo.py");
+  const content = fs.existsSync(modelsPath) ? fs.readFileSync(modelsPath, "utf8").replace(/\r\n/g, "\n") : "";
+  const collectionClassMatch = content.match(/^class\s+(\w*Collection)\b/m);
+  const moduleCollectionClass = collectionClassMatch?.[1];
+
+  // Everything below only READS - the module's file, the host's file, and
+  // (via planFieldDemotions) the host's live Mongo collection - building a
+  // fixed plan that every consent question below is asked against. No
+  // write happens until linkToHostCollection is reached at the very end.
+  const methodAdoptions = moduleCollectionClass
+    ? planMethodAdoptions(modelsPath, moduleCollectionClass, result.match)
+    : [];
+  const fieldDemotions = await planFieldDemotions(result.match);
+
   let confirmed = yes || alreadyLinked;
   if (!confirmed) {
     const answer = await ask(
@@ -309,18 +490,63 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
     );
     confirmed = answer === "y" || answer === "yes";
   }
+  if (!confirmed) return { linked: false, report: null };
 
-  if (confirmed) {
-    const { adoptedMethods } = linkToHostCollection(key, manifest, result.match);
-    if (!alreadyLinked) {
-      console.log(`Linked '${key}' to your existing ${result.match.collectionClass}.`);
-      if (adoptedMethods.length > 0) {
-        console.log(`  Adopted into ${result.match.collectionClass}: ${adoptedMethods.join(", ")}`);
-        console.log(`  (these are now part of your host's ${result.match.collectionClass} - inspect backend/models_mongo.py)`);
-      }
+  // Field-demotion consent is asked even on a re-sync where `yes`/
+  // `alreadyLinked` already answered the top-level link question - a
+  // schema-mutating consent must never be silently implied by an unrelated
+  // flag from a PREVIOUS run. `--yes` (this run's own flag) auto-consents
+  // to demotions too, same as it already auto-consents to the link prompt -
+  // --yes already means "unattended, trust the defaults" everywhere else in
+  // this CLI (mergeDependencies, ensureUiKit), so this stays consistent
+  // rather than inventing a new, narrower meaning for it here.
+  let fieldDemotionsToApply = fieldDemotions;
+  if (fieldDemotions.length > 0 && !yes) {
+    const { allConsented, consented } = await collectFieldDemotionConsent(result.match, fieldDemotions);
+    if (!allConsented) {
+      const declinedField = fieldDemotions[consented.length].field;
+      console.log(
+        `\n'${key}' was not linked to your existing ${result.match.collectionClass}: declined to demote ` +
+        `'${declinedField}' to optional. No changes were made to backend/models_mongo.py or '${key}'.`
+      );
+      return {
+        linked: false,
+        report: {
+          id: key,
+          hostCollection: result.match.collectionClass,
+          missing: [
+            {
+              field: declinedField,
+              moduleType: null,
+              hostType: result.match.fields[declinedField]?.pythonType ?? null,
+              reason: `real-data sampling found '${declinedField}' missing from existing documents, and demotion consent was declined`,
+            },
+          ],
+          wasLinked: alreadyLinked,
+        },
+      };
     }
-    return { linked: true, report: null, adoptedMethods };
+    fieldDemotionsToApply = consented;
   }
 
-  return { linked: false, report: null };
+  const plan = { methodAdoptions, fieldDemotions: fieldDemotionsToApply };
+  linkToHostCollection(key, manifest, result.match, plan);
+
+  if (!alreadyLinked) {
+    console.log(`Linked '${key}' to your existing ${result.match.collectionClass}.`);
+    if (plan.methodAdoptions.length > 0) {
+      console.log(`  Adopted into ${result.match.collectionClass}: ${plan.methodAdoptions.map((m) => m.name).join(", ")}`);
+      console.log(`  (these are now part of your host's ${result.match.collectionClass} - inspect backend/models_mongo.py)`);
+    }
+    if (plan.fieldDemotions.length > 0) {
+      console.log(`  Demoted to optional in ${result.match.modelClass}: ${plan.fieldDemotions.map((d) => d.field).join(", ")}`);
+    }
+  }
+
+  return {
+    linked: true,
+    report: null,
+    adoptedMethods: plan.methodAdoptions.map((m) => m.name),
+    demotedFields: plan.fieldDemotions.map((d) => ({ collectionClass: result.match.modelClass, field: d.field })),
+  };
 }
