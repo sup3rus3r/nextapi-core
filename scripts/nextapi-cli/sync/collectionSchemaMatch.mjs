@@ -44,28 +44,73 @@ function typesCompatible(moduleType, hostType) {
 }
 
 /**
- * Compares a module's own declared Pydantic model fields against a host
- * collection's real fields. Returns { match, compatible, missing, extra }.
- *
- * `missing` lists only REQUIRED-field problems that actually block linking:
- * a module field the host doesn't have (or has with an incompatible type)
- * IS ONLY BLOCKING if that module field is itself required (no default,
- * not Optional) - a module that merely EXTENDS the host shape with its own
- * optional extras (e.g. "department", "phone_number") is still perfectly
- * linkable, since those extra fields simply won't round-trip through the
- * host collection's own methods. The reverse also matters: if the module
- * never declares a field the HOST requires (e.g. a model that never sets
- * hashed_password), calling the host's own create()/etc. through the link
- * would break at runtime - that's blocking regardless of what the module
- * itself calls "required."
- *
- * `extra` lists non-blocking optional-field mismatches separately, purely
- * informational (not printed as a blocker anywhere) - kept in the return
- * shape in case a caller wants to surface "linked, but these fields are
- * module-only and won't persist" without conflating it with an actual
- * failure to link.
+ * Returns [{ id, fields: Set<string> }] for every OTHER module currently
+ * linked to the SAME host collection - read from each module's own
+ * lockfile-snapshotted `requiredModuleFields` (recorded once, at that
+ * module's own link time, in commands/sync.mjs). This is the only source of
+ * truth for "what did an already-linked module require," because linking
+ * deletes that module's own models_mongo.py (see linkToHostCollection) - its
+ * field declarations are never re-readable from disk after the fact. The
+ * snapshot is intentionally immutable history, never re-derived or
+ * re-written after its own module links, even if a LATER module's link
+ * causes one of its fields to be demoted on the host - it always reflects
+ * what that module's own model originally declared.
  */
-export function matchHostCollection(key, manifest) {
+function linkedModuleRequiredFields(lockfile, hostEntry) {
+  const perModule = [];
+  for (const id of Object.keys(lockfile?.modules ?? {})) {
+    const entry = lockfile.modules[id];
+    if (entry.status !== "installed") continue;
+    if (entry.linkedCollection !== true) continue;
+    if (entry.linkedHostCollection !== hostEntry.collectionName) continue;
+    perModule.push({ id, fields: new Set(entry.requiredModuleFields ?? []) });
+  }
+  return perModule;
+}
+
+/**
+ * Compares a module's own declared Pydantic model fields against a host
+ * collection's real fields, AND against every OTHER module currently linked
+ * to the same host collection. Returns { match, compatible, missing, extra,
+ * demotionCandidates, requiredModuleFields }.
+ *
+ * `missing` now lists ONLY genuine TYPE mismatches (a field both sides
+ * declare, with incompatible Python types) - the one kind of disagreement
+ * demotion can never fix, so it remains an unconditional block exactly as
+ * before.
+ *
+ * Field-PRESENCE disagreements (host requires a field the module doesn't
+ * set, or the module requires a field the host/another linked module
+ * doesn't have) are NO LONGER an automatic hard block. Instead they become
+ * `demotionCandidates`: for any field name required by at least one current
+ * party (the host's own live model, this module, or any already-linked
+ * module for this same host collection) but NOT required by at least one
+ * other current party, resolveCollectionLink asks explicit consent to
+ * demote that field to Optional wherever it's still declared required. This
+ * is the fix for a real production bug: a published module required
+ * `updated_at`, the host had no such field at all, and the old logic
+ * treated that as an unconditional rejection - when in fact the correct
+ * behavior is "ask whether it's fine for this field to simply not be
+ * enforced once linked," since the host's real create() never populates it
+ * either way.
+ *
+ * `demotionCandidates` entries are `{ field, requirerIds, hostHasField }` -
+ * `hostHasField` distinguishes a field the host's model actually declares
+ * (demotable via demoteFieldToOptional) from one the host has never
+ * declared at all (nothing to demote; the only sound action is a
+ * consent-only "this won't be enforced" notice, never inventing a new field
+ * on the host it never had - that would be promotion by addition, which is
+ * explicitly out of scope).
+ *
+ * `requiredModuleFields` is this module's OWN required-field-name list,
+ * snapshotted by the caller into the module's lockfile entry at link time
+ * (see commands/sync.mjs) - needed so a LATER module's own
+ * matchHostCollection call can see it via linkedModuleRequiredFields.
+ *
+ * `extra` is unchanged: non-blocking optional-field TYPE mismatches, purely
+ * informational.
+ */
+export function matchHostCollection(key, manifest, lockfile) {
   const declaredName = manifest.backend?.collection;
   const hostEntry = findHostCollection(declaredName);
   if (!hostEntry) return { match: null };
@@ -81,34 +126,65 @@ export function matchHostCollection(key, manifest) {
       compatible: false,
       missing: [{ field: "(entire model)", moduleType: null, hostType: null, reason: "could not parse the module's Pydantic model" }],
       extra: [],
+      demotionCandidates: [],
+      requiredModuleFields: [],
     };
   }
 
-  const missing = [];
+  // Type-shape compatibility stays pairwise and unconditional - the union
+  // mechanism below governs only WHETHER a field must be required at all,
+  // never what TYPE it must be. Two parties disagreeing on TYPE (not mere
+  // optionality) remains a hard block; only "required-but-absent-from-one-
+  // party" ever becomes a demotion candidate instead.
   const extra = [];
+  const missing = [];
   for (const [name, spec] of Object.entries(moduleFields)) {
     const hostField = hostEntry.fields[name];
-    const problem = !hostField
-      ? { field: name, moduleType: spec.pythonType, hostType: null }
-      : !typesCompatible(spec.pythonType, hostField.pythonType)
-        ? { field: name, moduleType: spec.pythonType, hostType: hostField.pythonType }
-        : null;
-    if (!problem) continue;
-    if (spec.optional) extra.push(problem);
-    else missing.push(problem);
-  }
-
-  // A field the HOST requires that the module's own model never declares
-  // at all also blocks linking - the module would call the host's real
-  // create()/etc. without ever supplying that field.
-  for (const [name, hostField] of Object.entries(hostEntry.fields)) {
-    if (hostField.optional) continue;
-    if (!(name in moduleFields)) {
-      missing.push({ field: name, moduleType: null, hostType: hostField.pythonType, reason: `host requires '${name}', module never sets it` });
+    if (!hostField) continue; // presence handled by the union step below, not here
+    if (!typesCompatible(spec.pythonType, hostField.pythonType)) {
+      const problem = { field: name, moduleType: spec.pythonType, hostType: hostField.pythonType };
+      if (spec.optional) extra.push(problem);
+      else missing.push(problem);
     }
   }
 
-  return { match: hostEntry, compatible: missing.length === 0, missing, extra };
+  const requiredModuleFields = Object.entries(moduleFields)
+    .filter(([, spec]) => !spec.optional)
+    .map(([name]) => name);
+
+  const requiredHostFields = findRequiredHostFields(hostEntry);
+  const linkedModules = linkedModuleRequiredFields(lockfile, hostEntry);
+
+  // Union of every field ANY current party (host, this newly-linking
+  // module, or any already-linked module for this same host collection)
+  // requires.
+  const allRequiredFieldNames = new Set([
+    ...requiredHostFields,
+    ...requiredModuleFields,
+    ...linkedModules.flatMap((m) => [...m.fields]),
+  ]);
+
+  const demotionCandidates = [];
+  for (const name of allRequiredFieldNames) {
+    const hostRequires = requiredHostFields.includes(name);
+    const moduleRequires = requiredModuleFields.includes(name);
+
+    const requirerIds = [];
+    if (hostRequires) requirerIds.push("host");
+    if (moduleRequires) requirerIds.push(key);
+    for (const m of linkedModules) if (m.fields.has(name)) requirerIds.push(m.id);
+
+    const nonRequirerIds = [];
+    if (!hostRequires) nonRequirerIds.push("host");
+    if (!moduleRequires) nonRequirerIds.push(key);
+    for (const m of linkedModules) if (!m.fields.has(name)) nonRequirerIds.push(m.id);
+
+    if (nonRequirerIds.length === 0) continue; // every relevant party requires it - stays required, no action
+
+    demotionCandidates.push({ field: name, requirerIds, nonRequirerIds, hostHasField: name in hostEntry.fields });
+  }
+
+  return { match: hostEntry, compatible: missing.length === 0, missing, extra, demotionCandidates, requiredModuleFields };
 }
 
 function ask(question) {
@@ -324,6 +400,73 @@ async function collectFieldDemotionConsent(hostEntry, demotions) {
 }
 
 /**
+ * Splits matchHostCollection's `demotionCandidates` into the two kinds of
+ * union-triggered demotion (see matchHostCollection's own doc comment for
+ * the full "who requires what" reasoning):
+ *
+ * - `hostHasField: true` candidates need a REAL mutation (the host's live
+ *   model currently declares this field required, and at least one current
+ *   party doesn't) - these get `demoteFieldToOptional`'d, exactly the same
+ *   primitive/target as the existing real-data-sampling path, just a
+ *   different trigger for proposing it.
+ * - `hostHasField: false` candidates have nothing to demote - the host's
+ *   model has never declared this field at all, so there is no file to
+ *   edit. The only sound action is a consent-only notice that the module
+ *   won't be able to rely on this field once linked - inventing a new field
+ *   on the host it never had would be adding a guarantee, not weakening
+ *   one, which is out of scope.
+ */
+function splitDemotionCandidates(demotionCandidates) {
+  const unionDemotions = demotionCandidates.filter((c) => c.hostHasField);
+  const moduleOnlyWaivers = demotionCandidates.filter((c) => !c.hostHasField);
+  return { unionDemotions, moduleOnlyWaivers };
+}
+
+/**
+ * Asks one consent question per union-triggered demotion candidate (see
+ * splitDemotionCandidates) - itemized, naming every current requirer and
+ * non-requirer by id so the user understands the actual conflict rather
+ * than just "field X is being changed." Distinct from
+ * collectFieldDemotionConsent (real-data-sampling-triggered) only in
+ * wording/trigger - the underlying contract (stop at first decline, caller
+ * treats a partial `consented` prefix as "apply none") is identical.
+ */
+async function collectUnionDemotionConsent(hostEntry, candidates) {
+  const consented = [];
+  for (const candidate of candidates) {
+    const { field, requirerIds, nonRequirerIds } = candidate;
+    const answer = await ask(
+      `'${hostEntry.collectionName}' collection: '${field}' is required by ${requirerIds.join(", ")}, but not by ` +
+      `${nonRequirerIds.join(", ")}. Demote '${field}' to optional in your host's ${hostEntry.modelClass} model so ` +
+      `all currently-linked modules stay compatible? (y/N) `
+    );
+    if (answer !== "y" && answer !== "yes") return { allConsented: false, consented };
+    consented.push(candidate);
+  }
+  return { allConsented: true, consented };
+}
+
+/**
+ * Asks one consent-only question per module-only-waiver candidate (see
+ * splitDemotionCandidates) - no host file write happens for these, ever;
+ * this only tells the user their module's own field won't be enforced once
+ * linked, since the host never had a slot for it in the first place.
+ */
+async function collectModuleOnlyWaiverConsent(key, hostEntry, candidates) {
+  const consented = [];
+  for (const candidate of candidates) {
+    const { field } = candidate;
+    const answer = await ask(
+      `'${key}' declares '${field}' as required, but your host's ${hostEntry.collectionClass} has no such field. ` +
+      `Link anyway? '${key}' will not be able to rely on '${field}' always being present once linked. (y/N) `
+    );
+    if (answer !== "y" && answer !== "yes") return { allConsented: false, consented };
+    consented.push(candidate);
+  }
+  return { allConsented: true, consented };
+}
+
+/**
  * The ONLY place either a method adoption or a field demotion actually
  * touches HOST_MODELS_PATH. Called exactly once, only after every consent
  * this module's link needs has already been collected (resolveCollectionLink
@@ -353,7 +496,14 @@ function applyLinkPlan(hostEntry, plan) {
     }
   }
 
-  for (const { field } of plan.fieldDemotions) {
+  // hostDataDemotions (real-Mongo-sampling-triggered) and unionDemotions
+  // (N-way-requirer-triggered) both resolve to the exact same mutation -
+  // demoteFieldToOptional against the host's real model - they only differ
+  // in WHY they were proposed, never in HOW they're applied, so they're
+  // concatenated and applied identically. moduleOnlyWaivers never reach
+  // this function at all (nothing to write for those - see
+  // splitDemotionCandidates's own doc comment).
+  for (const { field } of [...plan.hostDataDemotions, ...plan.unionDemotions]) {
     const updated = demoteFieldToOptional(hostContent, hostEntry.modelClass, field);
     // If the field line vanished between planning and now (the host file
     // was hand-edited mid-run, or an earlier module's write in this same
@@ -494,36 +644,45 @@ function renameUnlinkedModuleCollection(key, manifest) {
 /**
  * Runs the full link-or-report flow for one module. Returns
  * { linked: boolean, report } - `report` is set ({ id, hostCollection,
- * missing }) when the module was left unlinked (incompatible, the user
- * declined the link, or the user declined a field-demotion consent), for
- * sync.mjs to print an end-of-run summary; `linked` tells sync.mjs whether
- * to persist the decision on the module's lockfile entry so a later re-sync
- * (e.g. installing a new version of an already-linked module) doesn't ask
- * again - see the `alreadyLinked` param below for why that's necessary at
- * all: placeModuleFiles re-copies a fresh models_mongo.py from the newly
- * staged version on every sync, regardless of whether the PREVIOUS version
- * was linked, so file presence alone can't distinguish "never asked" from
- * "already said yes last time."
+ * missing }) when the module was left unlinked (a genuine type mismatch, the
+ * user declined the link, or the user declined any demotion/waiver
+ * consent), for sync.mjs to print an end-of-run summary; `linked` tells
+ * sync.mjs whether to persist the decision on the module's lockfile entry so
+ * a later re-sync (e.g. installing a new version of an already-linked
+ * module) doesn't ask again - see the `alreadyLinked` param below for why
+ * that's necessary at all: placeModuleFiles re-copies a fresh
+ * models_mongo.py from the newly staged version on every sync, regardless
+ * of whether the PREVIOUS version was linked, so file presence alone can't
+ * distinguish "never asked" from "already said yes last time."
+ *
+ * `lockfile` is required now (not optional) - matchHostCollection needs it
+ * to see every OTHER module currently linked to the same host collection,
+ * for the N-way union compatibility check (see matchHostCollection's own
+ * doc comment). commands/sync.mjs already has the lockfile in scope at its
+ * call site.
  *
  * Nothing is written to the host's backend/models_mongo.py until EVERY
- * consent this module's link needs has been collected - method adoptions
- * and field demotions are both computed (read-only) up front into a single
- * plan, and applyLinkPlan (inside linkToHostCollection) is the only call
- * that ever writes, called only after the link is confirmed AND every field
- * demotion is consented to. A decline anywhere in that sequence returns
- * before any write happens, so there is no partial state to roll back.
+ * consent this module's link needs has been collected - method adoptions,
+ * host-data demotions, union demotions, and module-only waivers are all
+ * computed (read-only) up front into a single plan, and applyLinkPlan
+ * (inside linkToHostCollection) is the only call that ever writes, called
+ * only after the link is confirmed AND every one of those consents has
+ * succeeded. A decline anywhere in that sequence returns before any write
+ * happens, so there is no partial state to roll back.
  */
-export async function resolveCollectionLink(key, manifest, { yes = false, alreadyLinked = false } = {}) {
-  const result = matchHostCollection(key, manifest);
+export async function resolveCollectionLink(key, manifest, { yes = false, alreadyLinked = false, lockfile } = {}) {
+  const result = matchHostCollection(key, manifest, lockfile);
   if (!result.match) return { linked: false, report: null };
 
   if (!result.compatible) {
-    // A module that was linked on a previous version but no longer
-    // qualifies (its new version's schema drifted incompatible) falls back
-    // to owning its own collection again - flagged distinctly from a
-    // first-time mismatch (wasLinked), since this case has real data
-    // already sitting in the host's collection under the old link that a
-    // generic "wasn't linked" message would leave the user unaware of.
+    // A genuine TYPE mismatch (not a mere presence disagreement, which is
+    // now consent-gated instead of a hard block - see matchHostCollection)
+    // still blocks unconditionally. A module that was linked on a previous
+    // version but no longer qualifies falls back to owning its own
+    // collection again - flagged distinctly from a first-time mismatch
+    // (wasLinked), since this case has real data already sitting in the
+    // host's collection under the old link that a generic "wasn't linked"
+    // message would leave the user unaware of.
     renameUnlinkedModuleCollection(key, manifest);
     return {
       linked: false,
@@ -544,7 +703,17 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
   const methodAdoptions = moduleCollectionClass
     ? planMethodAdoptions(modelsPath, moduleCollectionClass, result.match)
     : [];
-  const fieldDemotions = await planFieldDemotions(result.match);
+  const hostDataDemotions = await planFieldDemotions(result.match);
+  // A field the real-Mongo-sampling path already proposed doesn't need to
+  // be asked about again just because the union check also flagged it (this
+  // happens whenever the host itself is one of the "non-requirer" parties
+  // AND its real data also shows a gap for that same field) - dedupe by
+  // field name, keeping the union entry out in favor of the already-planned
+  // sampling one, so a field is only ever asked about once per sync run.
+  const hostDataFieldNames = new Set(hostDataDemotions.map((d) => d.field));
+  const { unionDemotions, moduleOnlyWaivers } = splitDemotionCandidates(
+    result.demotionCandidates.filter((c) => !hostDataFieldNames.has(c.field))
+  );
 
   let confirmed = yes || alreadyLinked;
   if (!confirmed) {
@@ -555,46 +724,69 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
   }
   if (!confirmed) return { linked: false, report: null };
 
-  // Field-demotion consent is asked even on a re-sync where `yes`/
-  // `alreadyLinked` already answered the top-level link question - a
+  // Every demotion/waiver consent below is asked even on a re-sync where
+  // `yes`/`alreadyLinked` already answered the top-level link question - a
   // schema-mutating consent must never be silently implied by an unrelated
-  // flag from a PREVIOUS run. `--yes` (this run's own flag) auto-consents
-  // to demotions too, same as it already auto-consents to the link prompt -
-  // --yes already means "unattended, trust the defaults" everywhere else in
-  // this CLI (mergeDependencies, ensureUiKit), so this stays consistent
-  // rather than inventing a new, narrower meaning for it here.
-  let fieldDemotionsToApply = fieldDemotions;
-  if (fieldDemotions.length > 0 && !yes) {
-    const { allConsented, consented } = await collectFieldDemotionConsent(result.match, fieldDemotions);
-    if (!allConsented) {
-      const declinedField = fieldDemotions[consented.length].field;
-      console.log(
-        `\n'${key}' was not linked to your existing ${result.match.collectionClass}: declined to demote ` +
-        `'${declinedField}' to optional. No changes were made to your host's backend/models_mongo.py.`
-      );
-      renameUnlinkedModuleCollection(key, manifest);
-      return {
-        linked: false,
-        report: {
-          id: key,
-          hostCollection: result.match.collectionClass,
-          missing: [
-            {
-              field: declinedField,
-              moduleType: null,
-              hostType: result.match.fields[declinedField]?.pythonType ?? null,
-              reason: `real-data sampling found '${declinedField}' missing from existing documents, and demotion consent was declined`,
-            },
-          ],
-          wasLinked: alreadyLinked,
-        },
-      };
-    }
-    fieldDemotionsToApply = consented;
+  // flag from a PREVIOUS run. `--yes` (THIS run's own flag) auto-consents to
+  // all of them, same as it already auto-consents to the link prompt - --yes
+  // already means "unattended, trust the defaults" everywhere else in this
+  // CLI (mergeDependencies, ensureUiKit), so this stays consistent rather
+  // than inventing a new, narrower meaning for it here.
+  function declineUnlinked(declinedField, reason) {
+    console.log(
+      `\n'${key}' was not linked to your existing ${result.match.collectionClass}: declined consent for ` +
+      `'${declinedField}'. No changes were made to your host's backend/models_mongo.py.`
+    );
+    renameUnlinkedModuleCollection(key, manifest);
+    return {
+      linked: false,
+      report: {
+        id: key,
+        hostCollection: result.match.collectionClass,
+        missing: [{ field: declinedField, moduleType: null, hostType: result.match.fields[declinedField]?.pythonType ?? null, reason }],
+        wasLinked: alreadyLinked,
+      },
+    };
   }
 
-  const plan = { methodAdoptions, fieldDemotions: fieldDemotionsToApply };
+  let hostDataDemotionsToApply = hostDataDemotions;
+  if (hostDataDemotions.length > 0 && !yes) {
+    const { allConsented, consented } = await collectFieldDemotionConsent(result.match, hostDataDemotions);
+    if (!allConsented) {
+      const declinedField = hostDataDemotions[consented.length].field;
+      return declineUnlinked(declinedField, `real-data sampling found '${declinedField}' missing from existing documents, and demotion consent was declined`);
+    }
+    hostDataDemotionsToApply = consented;
+  }
+
+  let unionDemotionsToApply = unionDemotions;
+  if (unionDemotions.length > 0 && !yes) {
+    const { allConsented, consented } = await collectUnionDemotionConsent(result.match, unionDemotions);
+    if (!allConsented) {
+      const declinedField = unionDemotions[consented.length].field;
+      const declinedCandidate = unionDemotions[consented.length];
+      return declineUnlinked(
+        declinedField,
+        `'${declinedField}' is required by ${declinedCandidate.requirerIds.join(", ")} but not by ${declinedCandidate.nonRequirerIds.join(", ")}, and demotion consent was declined`
+      );
+    }
+    unionDemotionsToApply = consented;
+  }
+
+  let moduleOnlyWaiversToApply = moduleOnlyWaivers;
+  if (moduleOnlyWaivers.length > 0 && !yes) {
+    const { allConsented, consented } = await collectModuleOnlyWaiverConsent(key, result.match, moduleOnlyWaivers);
+    if (!allConsented) {
+      const declinedField = moduleOnlyWaivers[consented.length].field;
+      return declineUnlinked(declinedField, `'${key}' requires '${declinedField}', which your host's ${result.match.collectionClass} has no field for, and the waiver was declined`);
+    }
+    moduleOnlyWaiversToApply = consented;
+  }
+
+  const plan = { methodAdoptions, hostDataDemotions: hostDataDemotionsToApply, unionDemotions: unionDemotionsToApply };
   linkToHostCollection(key, manifest, result.match, plan);
+
+  const allDemotedFields = [...plan.hostDataDemotions, ...plan.unionDemotions];
 
   if (!alreadyLinked) {
     console.log(`Linked '${key}' to your existing ${result.match.collectionClass}.`);
@@ -602,8 +794,11 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
       console.log(`  Adopted into ${result.match.collectionClass}: ${plan.methodAdoptions.map((m) => m.name).join(", ")}`);
       console.log(`  (these are now part of your host's ${result.match.collectionClass} - inspect backend/models_mongo.py)`);
     }
-    if (plan.fieldDemotions.length > 0) {
-      console.log(`  Demoted to optional in ${result.match.modelClass}: ${plan.fieldDemotions.map((d) => d.field).join(", ")}`);
+    if (allDemotedFields.length > 0) {
+      console.log(`  Demoted to optional in ${result.match.modelClass}: ${allDemotedFields.map((d) => d.field).join(", ")}`);
+    }
+    if (moduleOnlyWaiversToApply.length > 0) {
+      console.log(`  Not enforced (host has no such field): ${moduleOnlyWaiversToApply.map((w) => w.field).join(", ")}`);
     }
   }
 
@@ -611,6 +806,8 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
     linked: true,
     report: null,
     adoptedMethods: plan.methodAdoptions.map((m) => m.name),
-    demotedFields: plan.fieldDemotions.map((d) => ({ collectionClass: result.match.modelClass, field: d.field })),
+    demotedFields: allDemotedFields.map((d) => ({ collectionClass: result.match.modelClass, field: d.field })),
+    linkedHostCollection: result.match.collectionName,
+    requiredModuleFields: result.requiredModuleFields,
   };
 }

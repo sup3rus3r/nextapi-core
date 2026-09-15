@@ -111,6 +111,27 @@ export function removeModule(id, { purgeEnv = false, force = false } = {}) {
     );
   }
 
+  // Linking a module can also demote a HOST field to Optional (see
+  // collectionSchemaMatch.mjs's union/host-data demotion paths) whenever the
+  // module (or another already-linked module) didn't require it - a
+  // permanent, cross-cutting change to the host's own schema, not something
+  // scoped to this module's own files. Removing this module does NOT revert
+  // that demotion (reverting would be an unsound "promotion" back to
+  // required - other still-installed modules, or the host's own real data,
+  // may now also depend on the field being optional), but the user has no
+  // other way to know their host's schema still carries this module's trace
+  // after it's gone. Same conservative "warn, never auto-fix" default as
+  // the adoptedMethods case above.
+  if (entry.demotedFields?.length > 0) {
+    console.warn(
+      `\nWarning: linking '${id}' caused these fields to be demoted to optional in your host's ` +
+      `models_mongo.py: ${entry.demotedFields.map((d) => `${d.collectionClass}.${d.field}`).join(", ")}.\n` +
+      `They are NOT being restored to required automatically (other installed modules or your ` +
+      `host's own real data may now also depend on them being optional).\n` +
+      `Review backend/models_mongo.py by hand if you're sure nothing else needs them optional.`
+    );
+  }
+
   console.log(`Removed '${id}'. Restart your dev server to unload its backend code.`);
 }
 

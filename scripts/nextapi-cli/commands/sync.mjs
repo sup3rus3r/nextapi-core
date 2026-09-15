@@ -127,15 +127,22 @@ export async function sync({ yes = false } = {}) {
   for (const key of order) {
     const manifest = manifests.get(key);
     const alreadyLinked = getModuleEntry(lockfile, key)?.linkedCollection === true;
-    const { linked, report, adoptedMethods, demotedFields } = await resolveCollectionLink(key, manifest, { yes, alreadyLinked });
+    const { linked, report, adoptedMethods, demotedFields, linkedHostCollection, requiredModuleFields } =
+      await resolveCollectionLink(key, manifest, { yes, alreadyLinked, lockfile });
     const entryUpdate = { linkedCollection: linked };
-    // Only overwrite adoptedMethods/demotedFields when this run actually
-    // produced a fresh list (a re-sync that short-circuits via alreadyLinked
-    // never calls linkToHostCollection again, so both are undefined then -
-    // the previously recorded lists must survive untouched, not get wiped
-    // to []).
+    // Only overwrite adoptedMethods/demotedFields/linkedHostCollection/
+    // requiredModuleFields when this run actually produced a fresh value (a
+    // re-sync that short-circuits via alreadyLinked never calls
+    // linkToHostCollection again, so all four are undefined then - the
+    // previously recorded values must survive untouched, not get wiped).
+    // requiredModuleFields in particular must be recorded for EVERY
+    // successful link, whether or not it triggers anyone else's demotion -
+    // a module linking first still needs its requirement set on record so a
+    // LATER module's own union check (in matchHostCollection) can see it.
     if (adoptedMethods !== undefined) entryUpdate.adoptedMethods = adoptedMethods;
     if (demotedFields !== undefined) entryUpdate.demotedFields = demotedFields;
+    if (linkedHostCollection !== undefined) entryUpdate.linkedHostCollection = linkedHostCollection;
+    if (requiredModuleFields !== undefined) entryUpdate.requiredModuleFields = requiredModuleFields;
     setModuleEntry(lockfile, key, entryUpdate);
     if (report) unlinkedCollections.push(report);
   }
