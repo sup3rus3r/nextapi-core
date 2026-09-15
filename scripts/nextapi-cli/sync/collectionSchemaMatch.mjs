@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { BACKEND_DIR } from "../lib/paths.mjs";
-import { backendPackageNameForKey } from "../lib/moduleId.mjs";
+import { backendPackageNameForKey, collectionNameForKey } from "../lib/moduleId.mjs";
 import { findHostCollection } from "../lib/hostCollections.mjs";
 import {
   parseModuleModelFields,
@@ -430,6 +430,68 @@ export function linkToHostCollection(key, manifest, hostEntry, plan) {
 }
 
 /**
+ * A module that declares backend.collection matching a host-owned name
+ * (e.g. "users") but does NOT end up linked (incompatible fields, or a
+ * declined demotion consent) still keeps its own real UserCollection-style
+ * class - and until now, that class's own `collection_name = "users"`
+ * literal was NEVER rewritten to anything namespaced, even though
+ * collisionCheck.mjs already computes exactly what it should be
+ * (collectionNameForKey) to keep two modules from colliding with each
+ * other. That "namespaced per module" claim was only ever true for the
+ * ABSTRACT collision check - never actually applied to the module's real
+ * Python source - so an unlinked module using the host's own collection
+ * name in code writes to the SAME PHYSICAL MONGO COLLECTION as the host,
+ * despite having a fully separate code path. This is exactly what caused a
+ * real production crash: the module's own create_indexes() tried to create
+ * a plain (non-unique) "username_1" index on the host's real `users`
+ * collection, which already had a UNIQUE "username_1" index from the
+ * host's own UserCollection - same auto-generated name, incompatible
+ * definition, hard MongoDB error, uvicorn startup failure.
+ *
+ * Rewrites the module's own collection_name = "<declared>" literal (in its
+ * own models_mongo.py, using the module's OWN collection class name found
+ * via findCollectionClassSource) to the real namespaced name every other
+ * part of this codebase already assumes it has. Only called when
+ * matchHostCollection found a REAL host-collection-name collision
+ * (result.match is set) that didn't end in a link - a module whose declared
+ * name doesn't match any host collection at all has no host-collision risk
+ * to fix here (inter-module collisions remain collisionCheck.mjs's job,
+ * unchanged).
+ */
+function renameUnlinkedModuleCollection(key, manifest) {
+  const declaredName = manifest.backend?.collection;
+  if (!declaredName) return;
+
+  const pkg = backendPackageNameForKey(key, manifest);
+  const modelsPath = path.join(BACKEND_DIR, pkg, "models_mongo.py");
+  if (!fs.existsSync(modelsPath)) return;
+
+  const content = fs.readFileSync(modelsPath, "utf8").replace(/\r\n/g, "\n");
+  const collectionClassMatch = content.match(/^class\s+(\w*Collection)\b/m);
+  if (!collectionClassMatch) return;
+  const moduleCollectionClass = collectionClassMatch[1];
+
+  const classSource = findCollectionClassSource(content, moduleCollectionClass);
+  if (!classSource) return;
+
+  const namespacedName = collectionNameForKey(key, manifest, declaredName);
+  if (namespacedName === declaredName) return; // unscoped module - nothing to disambiguate
+
+  // Only rewrites the exact declared literal, inside this class's own body
+  // offsets - never touches an unrelated string that happens to match
+  // elsewhere in the file (e.g. a docstring or comment).
+  const classBody = classSource.body;
+  const literalRe = new RegExp(`(collection_name\\s*=\\s*)(['"])${declaredName}\\2`);
+  if (!literalRe.test(classBody)) return;
+
+  const updatedClassBody = classBody.replace(literalRe, `$1$2${namespacedName}$2`);
+  const updatedContent =
+    content.slice(0, classSource.bodyStart) + updatedClassBody + content.slice(classSource.bodyEnd);
+
+  fs.writeFileSync(modelsPath, updatedContent, "utf8");
+}
+
+/**
  * Runs the full link-or-report flow for one module. Returns
  * { linked: boolean, report } - `report` is set ({ id, hostCollection,
  * missing }) when the module was left unlinked (incompatible, the user
@@ -462,6 +524,7 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
     // first-time mismatch (wasLinked), since this case has real data
     // already sitting in the host's collection under the old link that a
     // generic "wasn't linked" message would leave the user unaware of.
+    renameUnlinkedModuleCollection(key, manifest);
     return {
       linked: false,
       report: { id: key, hostCollection: result.match.collectionClass, missing: result.missing, wasLinked: alreadyLinked },
@@ -507,8 +570,9 @@ export async function resolveCollectionLink(key, manifest, { yes = false, alread
       const declinedField = fieldDemotions[consented.length].field;
       console.log(
         `\n'${key}' was not linked to your existing ${result.match.collectionClass}: declined to demote ` +
-        `'${declinedField}' to optional. No changes were made to backend/models_mongo.py or '${key}'.`
+        `'${declinedField}' to optional. No changes were made to your host's backend/models_mongo.py.`
       );
+      renameUnlinkedModuleCollection(key, manifest);
       return {
         linked: false,
         report: {
