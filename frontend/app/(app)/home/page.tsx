@@ -144,6 +144,8 @@ const MANIFEST_FIELDS: { field: string; type: string; required?: boolean; descri
   { field: "schemaVersion", type: "integer", description: "Only meaningful alongside backend.collection. Bump it when the shape of an already-stored document changes, separately from version - see Versions below." },
   { field: "functions.uses / functions.provides", type: "string[]", description: "Functions this module calls from other modules, or makes available for others to call." },
   { field: "postInstall.message", type: "string", description: "A message shown after the module is installed, handy for any manual setup steps." },
+  { field: "notes", type: "string", description: "Optional. A short note shown to visitors on the module's Details tab before they install it, e.g. what kind of experience it is or a dependency worth knowing about. Plain language, no marketing copy." },
+  { field: "implementationNotes", type: "string", required: true, description: "Longer, maintainer-facing documentation: what's mocked and needs wiring to something real, what this module assumed about the host's schema or environment, and any setup beyond install. Minimum 200 characters, rejected by the registry if missing or too short." },
 ]
 
 export default function DocsPage() {
